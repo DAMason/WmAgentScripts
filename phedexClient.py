@@ -10,6 +10,7 @@ import json
 import urllib2,urllib, httplib, sys, re, os
 from xml.dom.minidom import getDOMImplementation
 
+
 def hasCustodialSubscription(datasetName):
     """
     Returns true if a given dataset has at least
@@ -50,11 +51,12 @@ def getSubscriptionSites(datasetName):
             sites.append(subscription['node'])
         return sites
 
-def getBlockReplicaSites(datasetName):
+def getBlockReplicaSites(datasetName, onlycomplete=False):
     """
     Return the list of sites wich have any replica
     of any block of a given dataset, either if they do have
     subscription or not.
+    if onlycomplete, it will return only the sites that have all the blocks completely transferred.
     """
     url = 'https://cmsweb.cern.ch/phedex/datasvc/json/prod/blockreplicas?dataset=' + datasetName
     result = json.loads(urllib2.urlopen(url).read())
@@ -64,9 +66,23 @@ def getBlockReplicaSites(datasetName):
         return sites
     elif not result['phedex']['block']:
         return sites
+    firstblock = True
     #check all subscriptions
     for block in result['phedex']['block']:
-        sites.add(block['replica'][0]['node'])
+        blocksites = set()
+        for r in block['replica']:
+            if r['complete'] == 'y':           
+                blocksites.add(r['node'])
+        #check for first block
+        if firstblock:
+            sites = blocksites
+            firstblock = False
+        #if we want any site, we do Union between sets
+        if not onlycomplete:
+            sites = sites | blocksites
+        #if we want only sites with all the blocks, we do intersection.
+        else:
+            sites = sites & blocksites
     return list(sites)
 
 def getCustodialMoveSubscriptionSite(datasetName):
@@ -99,8 +115,8 @@ def phedexGet(url, request, auth=True):
     auth: if aouthentication needs to be used
     """
     if auth:
-        conn = httplib.HTTPSConnection(url, cert_file = os.getenv('X509_USER_CERT'), 
-                                            key_file = os.getenv('X509_USER_KEY'))
+        conn = httplib.HTTPSConnection(url, cert_file = os.getenv('X509_USER_PROXY'), 
+                                            key_file = os.getenv('X509_USER_PROXY'))
         r1 = conn.request("GET", request)
         r2 = conn.getresponse()
         result = json.loads(r2.read())
@@ -110,6 +126,21 @@ def phedexGet(url, request, auth=True):
         r1 = urllib2.urlopen('https://'+url+request)
         result = json.loads(r1.read())
         return result
+
+def getFileCountDataset(url, dataset):
+    """
+    Returns the number of files registered in phedex
+    """
+    result = phedexGet(url, '/phedex/datasvc/json/prod/blockreplicas?dataset='+dataset, auth=False)
+    if 'block' not in result['phedex']:
+        return 0
+    elif not result['phedex']['block']:
+        return 0
+    files = 0
+    #check all blocks
+    for block in result['phedex']['block']:
+        files += block['files']
+    return files
         
 def getTransferPercentage(url, dataset, site):
     """
@@ -205,6 +236,19 @@ def testCustodialSubscriptionRequested(url, dataset, site):
     return False
 
 def getCustodialSubscriptionRequestSite(datasetName):
+    try:
+        r = try_getCustodialSubscriptionRequestSite(datasetName)
+    except:
+        try:
+            r = try_getCustodialSubscriptionRequestSite(datasetName)
+
+        except:
+            ## yes or NO ?
+            r = []
+    return r
+            
+
+def try_getCustodialSubscriptionRequestSite(datasetName):
     """
     Returns the site (or sites) in which the dataset has
     a custodial subscription request, no matter if it was approved
@@ -213,25 +257,30 @@ def getCustodialSubscriptionRequestSite(datasetName):
     the dataset
     """
     url = 'cmsweb.cern.ch'
-    result = phedexGet(url, '/phedex/datasvc/json/prod/requestlist?dataset='+datasetName+'&type=xfer')
+    result = phedexGet(url, '/phedex/datasvc/json/prod/requestlist?dataset='+datasetName+'&type=xfer&node=T*_MSS')
+    #result = phedexGet(url, '/phedex/datasvc/json/prod/requestlist?dataset='+datasetName+'&type=xfer')
     requests=result['phedex']
     #gets dataset subscription requests
     if 'request' not in requests.keys():
-        return False
+        print "no result for",datasetName,"in phedex request list"
+        return []
     sites = []
     #if there is a request
     for request in result['phedex']['request']:
         #if there are pending or aprroved request, watch the satus of them
-        if request['approval']=='pending' or request['approval']=='approved':
+        if request['approval'] in ['pending','approved','mixed']:
             requestId = request['id']
+            ### check only MSS endpoints
+            #print "check",requestId
             result = phedexGet(url, '/phedex/datasvc/json/prod/transferrequests?request='+str(requestId))
             #if not empty
             if result['phedex']['request']:
+                #print len(result['phedex']['request'])
                 requestSubscription = result['phedex']['request'][0]
                 #see if its custodial
                 if requestSubscription['custodial']=='y':
                     sites.append(requestSubscription['destinations']['node'][0]['name'])
-    return sites if sites else False
+    return sites if sites else []
 
 def testOutputDataset(datasetName):
     """
@@ -278,8 +327,8 @@ def createXML(datasets):
     From a list of datasets return an XML of the datasets in the format required by Phedex
     """
     # Create the minidom document
-    impl=getDOMImplementation()
-    doc=impl.createDocument(None, "data", None)
+    impl = getDOMImplementation()
+    doc = impl.createDocument(None, "data", None)
     result = doc.createElement("data")
     result.setAttribute('version', '2')
     # Create the <dbs> base element
@@ -288,7 +337,7 @@ def createXML(datasets):
     result.appendChild(dbs)    
     #Create each of the <dataset> element            
     for datasetname in datasets:
-        dataset=doc.createElement("dataset")
+        dataset = doc.createElement("dataset")
         dataset.setAttribute("is-open","y")
         dataset.setAttribute("is-transient","y")
         dataset.setAttribute("name",datasetname)
@@ -305,13 +354,18 @@ def phedexPost(url, request, params):
     request: the request suffix url
     params: a dictionary with the POST parameters
     """
-    conn = httplib.HTTPSConnection(url, cert_file = os.getenv('X509_USER_CERT'), 
-                                        key_file = os.getenv('X509_USER_KEY'))
-    encodedParams = urllib.urlencode(params)
+    conn = httplib.HTTPSConnection(url, cert_file = os.getenv('X509_USER_PROXY'), 
+                                        key_file = os.getenv('X509_USER_PROXY'))
+    encodedParams = urllib.urlencode(params, doseq=True)
+    #encodedParams = json.dumps(params)
     r1 = conn.request("POST", request, encodedParams)
     r2 = conn.getresponse()
-    result = json.loads(r2.read())
+    message = r2.read()
     conn.close()
+    try:
+        result = json.loads(message)
+    except:
+        return message
     return result
 
 def createParams(site, datasetXML, comments):
@@ -323,23 +377,46 @@ def createParams(site, datasetXML, comments):
                 "move":"n","no_mail":"n", "comments":comments}
     return params
 
-def makeCustodialMoveRequest(url, site, datasets, comments):
+def makeDeletionRequest(url, site, datasets, comments):
+    """
+    Creates a deletion request
+    """
     dataXML = createXML(datasets)
-    params = createParams(site, dataXML, comments)
+    params = {  "node":site,
+                "data":dataXML,
+                "level":"dataset",
+                "rm_subscriptions":"y", 
+                "comments":comments}
+    
+    response = phedexPost(url, "/phedex/datasvc/json/prod/delete", params)
+    return response
+
+def makeMoveRequest(url, site, datasets, comments, priority='high',custodial='n'):
+    dataXML = createXML(datasets)
+    params = { "node" : site,
+                "data" : dataXML,
+                "group": "DataOps",
+                "priority": priority,
+                "custodial":custodial,
+                "request_only":"y",
+                "move":"n",
+                "no_mail":"n",
+                "comments":comments}
     response = phedexPost(url, "/phedex/datasvc/json/prod/subscribe", params)
     return response
 
-def makeCustodialReplicaRequest(url, site,datasets, comments):    
+def makeReplicaRequest(url, site,datasets, comments, priority='high',custodial='n'): # priority used to be normal
     dataXML = createXML(datasets)
-    params = { "node" : site,"data" : dataXML, "group": "DataOps", "priority":'normal',
-                 "custodial":"y","request_only":"y" ,"move":"n","no_mail":"n","comments":comments}   
+    params = { "node" : site,
+                "data" : dataXML,
+                "group": "DataOps",
+                "priority": priority,
+                "custodial":custodial,
+                "request_only":"y",
+                "move":"n",
+                "no_mail":"n",
+                "comments":comments}
     response = phedexPost(url, "/phedex/datasvc/json/prod/subscribe", params)
-    return response
-
-def makeCustodialXML(url, datasets):
-    dataXML = createXML(datasets)
-    params = createParams(site, dataXML, "Custodial Subscription for "+comments)
-    response = phedexPost(url, "/phedex/datasvc/xml/prod/subscribe", params)
     return response
 
 def main():
@@ -352,9 +429,8 @@ def main():
     url='cmsweb.cern.ch'
     #reads file, striping and ignoring empty lines
     outputdatasets = [ds.strip() for ds in open(filename).readlines() if ds.strip()]
-    makeCustodialXML(url, outputdatasets)
-    print response.status, response.reason
-    print response.read()
+    resp = makeReplicaRequest(url, site, outputdatasets, comments)
+    print resp
     
     sys.exit(0);
 
